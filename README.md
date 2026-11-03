@@ -1,17 +1,37 @@
 # RSNA Intracranial Aneurysm Detection
 
-My solution for the [RSNA Intracranial Aneurysm Detection](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection) competition on Kaggle. A 3D U-Net finds aneurysms in CTA, MRA and MRI series and assigns them to one of 13 arterial locations.
+My solution for the [RSNA Intracranial Aneurysm Detection](https://www.kaggle.com/competitions/rsna-intracranial-aneurysm-detection) competition on Kaggle: a 3D U-Net that finds aneurysms in CTA, MRA and MRI series and assigns them to one of 13 arterial locations.
 
 This is a late submission, made after the competition ended. It scores 0.88294 on the private leaderboard and 0.90237 on the public leaderboard. The 5-fold cross-validation score is 0.8997.
 
-![Kaggle late submission](kaggle_submission.png)
+| | score |
+|---|---|
+| 5-fold CV (out of fold, 4348 series) | 0.8997 |
+| Public leaderboard | 0.90237 |
+| Private leaderboard | 0.88294 |
+
 
 ## Method
 
-- Preprocessing: each series is resampled into a 256³ cube around the brain, found with an HD-BET brain mask. CT and MR intensities are normalized and everything far from the brain is removed.
-- Model: a 3D U-Net with the pretrained ResEnc-L encoder of [nnFoundationCNN](https://huggingface.co/MIC-DKFZ/nnFoundationCNN) and a decoder with CBAM attention. It predicts an aneurysm heatmap and a map of the 13 vessel locations, and the series probabilities are read from the strongest voxels.
-- Training: 5 folds on 128³ patches, about 10 hours per fold on 2x T4.
-- Inference: same preprocessing, sliding window, average of the 5 folds.
+**Preprocessing.** Each series is turned into a 256³ cube around the brain.
+
+- The main image stack is rebuilt from the DICOM geometry, using only the tags that are kept in the test set. Missing pixel spacing of multi-frame files is taken from a table built on the training data. CT series with a wrong rescale intercept are detected and fixed.
+- The head is located on a coarse 4 mm overview and HD-BET gives the brain mask inside it.
+- The cube covers the brain plus a margin (140 to 210 mm, so 0.55 to 0.82 mm voxels) and follows the patient axes.
+- CT is windowed to [-100, 900] HU, MR is scaled between the 0.5 and 99.95 percentiles inside the brain, then stored as uint8. Voxels more than 20 mm from the brain are set to zero and the distance to the brain is stored with the image.
+- The vessel segmentations that come with part of the training data are resampled into the cube and used as territory labels.
+
+**Model.** U-Net with the ResEnc-L encoder of [nnFoundationCNN](https://huggingface.co/MIC-DKFZ/nnFoundationCNN) (self-supervised pretraining on unlabeled 3D scans) and a new decoder with CBAM attention on the skip connections. It works on 128³ patches and outputs at half resolution:
+
+- an aneurysm heatmap (Gaussian targets with sigma 3 mm, focal loss),
+- a vessel territory map with 14 classes (13 locations and background),
+- an auxiliary heatmap at quarter resolution and the modality.
+
+A small network on the voxel coordinates adds a position prior to the heatmap and territory logits. Series probabilities are read from the 8 strongest voxels: P(aneurysm) is the mean of the top 8 heatmap probabilities, P(location) is the same on heatmap x territory probability. These readouts get their own BCE loss during training.
+
+**Training.** 5 folds stratified on locations and modality, grouped by patient. SGD with Nesterov momentum 0.99, learning rate 1e-3 (x3 for the new layers), 1500 warmup steps then poly decay, 36k steps with a batch of 2 per GPU on 2x T4, about 10 hours per fold. Half of the patches contain an annotated aneurysm, sampled so that rare locations and modalities are not drowned out; most of the other patches are taken around typical aneurysm positions. Augmentations: left/right flip with location swap, rotation, scaling, random brain margin, bias field, brightness, contrast, gamma, low resolution and noise.
+
+**Inference.** Same preprocessing on the test series, sliding window over the part of the cube where aneurysms are found in training, average of the 5 folds.
 
 ## Setup
 
@@ -19,7 +39,7 @@ This is a late submission, made after the competition ended. It scores 0.88294 o
 pip install -r requirements.txt
 ```
 
-Put the competition data in `data/rsna-intracranial-aneurysm-detection`.
+Download the competition data into `data/rsna-intracranial-aneurysm-detection` (or change `DATA_DIR` at the top of `preprocess.py`).
 
 ## 1. Preprocessing
 
@@ -27,11 +47,16 @@ Put the competition data in `data/rsna-intracranial-aneurysm-detection`.
 python preprocess.py
 ```
 
-The output goes to `data/prepared` (about 24 GB). If it stops, run it again and it continues where it stopped.
+It runs one process per GPU. If it stops, run it again: finished series are skipped. The output goes to `data/prepared` (about 24 GB):
+
+- `vol/` one file per series with the cube, the distance map and the territory labels
+- `series.parquet` labels, folds and preprocessing details for each series
+- `points.parquet` aneurysm positions in cube coordinates
+- `prep_config.json` and `ps_table.json`, needed again at inference
 
 ## 2. Training
 
-Set the fold at the top of `train.py`:
+Train the folds one by one. Set the fold at the top of `train.py`:
 
 ```python
 FOLD = 0
@@ -43,7 +68,9 @@ and run
 torchrun --standalone --nproc_per_node=2 train.py
 ```
 
-Repeat with `FOLD = 1`, `2`, `3` and `4`. On Kaggle (2x T4), put `NCCL_P2P_DISABLE=1` in front of the command. The pretrained weights are downloaded on the first run, and each fold is saved in `runs/fold0`, `runs/fold1`, and so on.
+Repeat with `FOLD = 1`, `2`, `3` and `4`. On Kaggle 2x T4 put `NCCL_P2P_DISABLE=1` in front of the command.
+
+The pretrained weights are downloaded from Hugging Face on the first run. The training state is saved every 1000 steps in `runs/fold0/train_state.pth` and the same command resumes from it. At the end `runs/fold0/model.pt` is written and the held-out fold is evaluated (`val.json`, `oof.parquet`).
 
 ## 3. Kaggle submission
 
@@ -51,11 +78,12 @@ Repeat with `FOLD = 1`, `2`, `3` and `4`. On Kaggle (2x T4), put `NCCL_P2P_DISAB
 python export.py
 ```
 
-Run it in a Kaggle notebook with internet on, so the packages it collects match the Kaggle Python version. Upload the `kaggle_dataset/` folder as a Kaggle dataset. Then, in a notebook with GPU T4 x2, internet off, the competition data and this dataset attached, run:
+This puts the 5 models, the HD-BET weights, the preprocessing files, the code and the wheels of the packages missing on Kaggle into `kaggle_dataset/`. Some of the wheels are compiled, so run it with the same Python version as the Kaggle image (a Kaggle notebook with internet on works). Upload the folder as a Kaggle dataset, then create a notebook with GPU T4 x2, internet off, the competition data and the dataset attached, and run:
 
 ```
 !pip install -q --no-index --no-deps /kaggle/input/aneurysm-models/wheels/*.whl
 %run /kaggle/input/aneurysm-models/submit.py
 ```
 
-Change the path to where Kaggle mounts your dataset.
+(use the path where Kaggle mounts your dataset). The hidden test set takes about 8 to 9 hours. Series that are still left after 10.5 hours, or that fail, get the training prevalence.
+
