@@ -10,6 +10,7 @@ This is a late submission, made after the competition ended. It scores 0.88294 o
 | Public leaderboard | 0.90237 |
 | Private leaderboard | 0.88294 |
 
+![Kaggle late submission](kaggle_submission.png)
 
 ## Method
 
@@ -86,5 +87,6 @@ This puts the 5 models, the HD-BET weights, the preprocessing files, the code an
 ```
 
 (use the path where Kaggle mounts your dataset). The hidden test set takes about 8 to 9 hours. Series that are still left after 10.5 hours, or that fail, get the training prevalence.
+
 
 
