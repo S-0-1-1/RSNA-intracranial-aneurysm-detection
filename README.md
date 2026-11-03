@@ -16,19 +16,17 @@ This is a late submission, made after the competition ended. It scores 0.88294 o
 
 **Preprocessing.** A series is a stack of 2D DICOM images. Each series is turned into one 3D image: a cube of 256 x 256 x 256 voxels centered on the brain. This way every scan has the same format and orientation, whatever the scanner or the modality.
 
-- The slices are put back in the right order using the position information stored in the DICOM files, and only the information that is also present in the test scans is used. Some scans are fixed on the way, for example CT scans with a wrong brightness offset, or files where the pixel size is missing.
-- HD-BET, a tool made to find the brain in a scan, gives the brain area, and the cube is cut around it.
-- CT and MRI brightness values are put on the same 0 to 255 scale. Everything more than 2 cm away from the brain (neck, face, background) is set to black. The 2 cm margin keeps the arteries at the base of the brain, where aneurysms are.
-- 178 training series come with masks of the brain arteries. These masks are moved into the same cube, so the model can learn where each artery is.
+- We put the slices in the correct order using information stored in the DICOM files. We only use information that is also available in the test scans. We also fix some problems, such as incorrect brightness in CT scans or missing pixel size information.
+- We use HD-BET to find the brain in each scan. Then, we cut a cube around the brain.
+- We convert CT and MRI image values to the same range (0 to 255). Areas more than 2 cm away from the brain are changed to black. We keep this 2 cm area because important arteries near the bottom of the brain may contain aneurysms.
+- 178 training scans also have masks showing the brain arteries. We apply the same cropping process to these masks so they match the 3D images. This helps the model learn where the arteries are.
 
-**Model.** The model is a 3D U-Net. It looks at a block of 128 x 128 x 128 voxels and gives two answers for every point of the block:
+**Model.** 3D CBAM U-Net. It takes a block of 128 x 128 x 128 voxels as input and gives two outputs for every point in the block:
+- The probability that an aneurysm is present at that point (heatmap). During training, the model learns to create a small area around each aneurysm point marked in the training data.
+- The artery location: one of the 13 possible artery locations, or none.
+The first half of the network (encoder) comes from nnFoundationCNN. It was already trained on a large number of 3D scans without labels, so it has already learned useful information about medical images. The second half (decoder) is new and is trained for this task. CBAM attention blocks help the model focus on important areas. The model also receives the position of each point in the cube, since aneurysms are more common in certain brain areas. Two additional outputs are used only during training to help the model learn.
 
-- how likely it is that an aneurysm is there (a heatmap). During training, the target is a small blob around each aneurysm point marked in the training data;
-- which of the 13 artery locations the point belongs to, or none.
-
-The first half of the network (the encoder) comes from [nnFoundationCNN](https://huggingface.co/MIC-DKFZ/nnFoundationCNN), which was already trained on a very large number of unlabeled 3D scans, so it starts with a good idea of what medical images look like. The second half (the decoder) is new and is trained here. Its CBAM attention blocks help it focus on the useful parts of the image. The model also receives the position of each point in the cube, because aneurysms appear in typical places. Two small extra outputs are used only to help the training.
-
-The final answer for a series comes from its strongest points. The probability that there is an aneurysm is the average of the 8 highest heatmap values, and the probability of each location is computed the same way, from the heatmap combined with the artery map.
+The final prediction for a scan is based on its strongest points. The aneurysm probability is the average of the 8 highest heatmap values. The probability of each artery location is calculated in the same way, using both the heatmap and the artery map.
 
 **Training.** The data is split into 5 parts. Each of the 5 models is trained on 4 parts and checked on the remaining one, and all the series of a patient stay in the same part. Half of the training blocks contain an aneurysm, and rare locations and modalities are shown more often so that the model does not ignore them. The blocks are also randomly flipped left to right (with the left and right labels swapped), rotated, resized, changed in brightness and contrast, and made blurrier or noisier, so the model sees more variety than the data alone gives. Each model trains for 36,000 steps, about 10 hours on two T4 GPUs.
 
@@ -85,8 +83,6 @@ This puts the 5 models, the HD-BET weights, the preprocessing files, the code an
 !pip install -q --no-index --no-deps /kaggle/input/aneurysm-models/wheels/*.whl
 %run /kaggle/input/aneurysm-models/submit.py
 ```
-
-(use the path where Kaggle mounts your dataset). The hidden test set takes about 8 to 9 hours. Series that are still left after 10.5 hours, or that fail, get the training prevalence.
 
 
 
